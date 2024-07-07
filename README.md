@@ -4,12 +4,13 @@ This source code is modified from MP-SENet.
 1. Python >= 3.6.
 2. Clone this repository.
 3. Install python requirements. These aren't the full requirements for some reason so they'll be updated
+4. A dataset, you can usually make this yourself, I may provide some dataset creation scrips in the future.
 
 ## Training
 ```
 python train.py --config {config_name}.json
 ```
-Checkpoints and copy of the configuration file are saved in the `cp_mpsenet-1024-declio` directory by default.<br>
+Checkpoints and a copy of the config file are currently saved in the `cp_mpsenet-1024-declip` directory by default.<br>
 You can change the path by adding `--checkpoint_path` option.
 The code by default scans your system for all avaialble GPUs to train on but if it's home machine and you happen to have 2 GPUs (let's say an RTX 2070 and a Quadro P4000) but want to still use your machine whist training during the day, you can use the `--solo_GPU` flag followed by the ID of the GPU i.e. `--solo_GPU 1` for just the Quadro P4000.
 
