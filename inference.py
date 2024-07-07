@@ -11,6 +11,7 @@ from env import AttrDict
 from datasets.dataset import mag_pha_stft, mag_pha_istft
 from models.generator import MPNet
 import soundfile as sf
+import numpy as np
 
 h = None
 device = None
@@ -29,6 +30,56 @@ def scan_checkpoint(cp_dir, prefix):
         return ''
     return sorted(cp_list)[-1]
 
+def split_audio_with_overlap(audio, sample_rate, segment_length=3, overlap=2):
+    segment_length_samples = segment_length * sample_rate
+    overlap_samples = overlap * sample_rate
+    
+    segments = []
+    start = 0
+    while start < len(audio):
+        end = min(start + segment_length_samples, len(audio))
+        segment = audio[start:end]
+        segments.append(segment)
+        start += segment_length_samples - overlap_samples
+
+        if end == len(audio):
+            break
+    
+    return segments
+
+def process_segment(segment, model, device, h):
+    segment = torch.FloatTensor(segment).to(device)
+    norm_factor = torch.sqrt(len(segment) / torch.sum(segment ** 2.0)).to(device)
+    segment = (segment * norm_factor).unsqueeze(0)
+
+    noisy_amp, noisy_pha, noisy_com = mag_pha_stft(segment, h.n_fft, h.hop_size, h.win_size, h.compress_factor)
+    amp_g, pha_g, com_g = model(noisy_amp, noisy_pha)
+    audio_g = mag_pha_istft(amp_g, pha_g, h.n_fft, h.hop_size, h.win_size, h.compress_factor)
+    audio_g = audio_g / norm_factor
+    
+    return audio_g.squeeze().cpu().numpy()
+
+def crossfade_segments(segments, overlap_samples):
+    if len(segments) == 1:
+        return segments[0]
+    
+    crossfaded_audio = segments[0]
+    for i in range(1, len(segments)):
+        start_overlap = crossfaded_audio[-overlap_samples:]
+        end_overlap = segments[i][:overlap_samples]
+
+        # Ensure the overlapping segments have the same length
+        min_length = min(len(start_overlap), len(end_overlap))
+        start_overlap = start_overlap[:min_length]
+        end_overlap = end_overlap[:min_length]
+
+        # Crossfade
+        crossfade = np.linspace(1, 0, min_length) * start_overlap + np.linspace(0, 1, min_length) * end_overlap
+        
+        crossfaded_audio = np.concatenate((crossfaded_audio[:-min_length], crossfade, segments[i][min_length:]))
+    
+    return crossfaded_audio
+
 def inference(a):
     model = MPNet(h).to(device)
 
@@ -42,21 +93,25 @@ def inference(a):
 
     model.eval()
 
+    overlap_samples = 2*43998 #2*44062
+
     with torch.no_grad():
         for i, index in enumerate(test_indexes):
             print(index)
-            noisy_wav, _ = librosa.load(os.path.join(a.input_noisy_wavs_dir, index+'.wav'), h.sampling_rate)
-            noisy_wav = torch.FloatTensor(noisy_wav).to(device)
-            norm_factor = torch.sqrt(len(noisy_wav) / torch.sum(noisy_wav ** 2.0)).to(device)
-            noisy_wav = (noisy_wav * norm_factor).unsqueeze(0)
-            noisy_amp, noisy_pha, noisy_com = mag_pha_stft(noisy_wav, h.n_fft, h.hop_size, h.win_size, h.compress_factor)
-            amp_g, pha_g, com_g = model(noisy_amp, noisy_pha)
-            audio_g = mag_pha_istft(amp_g, pha_g, h.n_fft, h.hop_size, h.win_size, h.compress_factor)
-            audio_g = audio_g / norm_factor
+            noisy_wav, _ = librosa.load(os.path.join(a.input_noisy_wavs_dir, index + '.wav'), h.sampling_rate)
 
-            output_file = os.path.join(a.output_dir, index+'.wav')
+            # Split audio into segments with overlap
+            segments = split_audio_with_overlap(noisy_wav, h.sampling_rate)
 
-            sf.write(output_file, audio_g.squeeze().cpu().numpy(), h.sampling_rate, 'PCM_16')
+            # Process each segment
+            processed_segments = [process_segment(seg, model, device, h) for seg in segments]
+
+            # Concatenate processed segments
+            processed_audio = crossfade_segments(processed_segments, overlap_samples)
+
+            output_file = os.path.join(a.output_dir, index + '.wav')
+
+            sf.write(output_file, processed_audio, h.sampling_rate, 'PCM_16')
 
 
 def main():
@@ -64,7 +119,7 @@ def main():
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--input_clean_wavs_dir', default='VoiceBank+DEMAND/wavs_clean')
-    parser.add_argument('--input_noisy_wavs_dir', default='VoiceBank+DEMAND/wav_noisy')
+    parser.add_argument('--input_noisy_wavs_dir', default='VoiceBank+DEMAND/wavs_noisy')
     parser.add_argument('--input_test_file', default='VoiceBank+DEMAND/test.txt')
     parser.add_argument('--output_dir', default='generated_files')
     parser.add_argument('--checkpoint_file', required=True)

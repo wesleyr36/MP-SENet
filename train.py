@@ -16,12 +16,17 @@ from datasets.dataset import Dataset, mag_pha_stft, mag_pha_istft, get_dataset_f
 from models.generator import MPNet, pesq_score, phase_losses
 from models.discriminator import MetricDiscriminator, batch_pesq
 from utils import scan_checkpoint, load_checkpoint, save_checkpoint
+from pystoi import stoi
+from torchmetrics import SignalDistortionRatio
 
 torch.backends.cudnn.benchmark = True
 
+def batch_stoi(clean_audio_list, generated_audio_list, sample_rate):
+    scores = [stoi(clean, gen, sample_rate) for clean, gen in zip(clean_audio_list, generated_audio_list)]
+    return torch.tensor(scores)
 
 def train(rank, a, h):
-    if h.num_gpus > 1:
+    if h.num_gpus > 1 and a.solo_GPU == None:
         init_process_group(backend=h.dist_config['dist_backend'], init_method=h.dist_config['dist_url'],
                            world_size=h.dist_config['world_size'] * h.num_gpus, rank=rank)
 
@@ -31,7 +36,7 @@ def train(rank, a, h):
     generator = MPNet(h).to(device)
     discriminator = MetricDiscriminator().to(device)
 
-    if rank == 0:
+    if rank == 0 or a.solo_GPU is not None:
         print(generator)
         num_params = 0
         for p in generator.parameters():
@@ -57,7 +62,7 @@ def train(rank, a, h):
         steps = state_dict_do['steps'] + 1
         last_epoch = state_dict_do['epoch']
     
-    if h.num_gpus > 1:
+    if h.num_gpus > 1 and a.solo_GPU == None:
         generator = DistributedDataParallel(generator, device_ids=[rank]).to(device)
         discriminator = DistributedDataParallel(discriminator, device_ids=[rank]).to(device)
 
@@ -75,19 +80,19 @@ def train(rank, a, h):
 
     trainset = Dataset(training_indexes, a.input_clean_wavs_dir, a.input_noisy_wavs_dir,
                        h.segment_size, h.n_fft, h.hop_size, h.win_size, h.sampling_rate, h.compress_factor,
-                       split=True, n_cache_reuse=0, shuffle=False if h.num_gpus > 1 else True, device=device)
+                       split=True, n_cache_reuse=0, shuffle=False if (h.num_gpus > 1 and a.solo_GPU is None) else True, device=device)
 
-    train_sampler = DistributedSampler(trainset) if h.num_gpus > 1 else None
+    train_sampler = DistributedSampler(trainset) if (h.num_gpus > 1 and a.solo_GPU is None) else None
 
     train_loader = DataLoader(trainset, num_workers=h.num_workers, shuffle=False,
                               sampler=train_sampler,
                               batch_size=h.batch_size,
                               pin_memory=True,
                               drop_last=True)
-    if rank == 0:
+    if rank == 0 or a.solo_GPU is not None:
         validset = Dataset(validation_indexes, a.input_clean_wavs_dir, a.input_noisy_wavs_dir,
-                           h.segment_size, h.n_fft, h.hop_size, h.win_size, h.sampling_rate, h.compress_factor,
-                           split=False, shuffle=False, n_cache_reuse=0, device=device)
+                           h.valid_segment_size, h.n_fft, h.hop_size, h.win_size, h.sampling_rate, h.compress_factor,
+                           split=True, n_cache_reuse=0, shuffle=False, device=device)
         
         validation_loader = DataLoader(validset, num_workers=1, shuffle=False,
                                        sampler=None,
@@ -100,17 +105,20 @@ def train(rank, a, h):
     generator.train()
     discriminator.train()
 
+    with open('VoiceBank+DEMAND/test.txt', 'r', encoding='utf-8') as fi:
+        val_lines = [x.split('|')[0] for x in fi.read().split('\n') if len(x) > 0]
+
     for epoch in range(max(0, last_epoch), a.training_epochs):
-        if rank == 0:
+        if rank == 0 or a.solo_GPU is not None:
             start = time.time()
             print("Epoch: {}".format(epoch+1))
 
-        if h.num_gpus > 1:
+        if h.num_gpus > 1 and a.solo_GPU == None:
             train_sampler.set_epoch(epoch)
 
         for i, batch in enumerate(train_loader):
 
-            if rank == 0:
+            if rank == 0 or a.solo_GPU is not None:
                 start_b = time.time()
             clean_audio, clean_mag, clean_pha, clean_com, noisy_mag, noisy_pha = batch # [B, 1, F, T], F = nfft // 2+ 1, T = nframes
             clean_audio = torch.autograd.Variable(clean_audio.to(device, non_blocking=True))
@@ -125,20 +133,24 @@ def train(rank, a, h):
 
             audio_g = mag_pha_istft(mag_g, pha_g, h.n_fft, h.hop_size, h.win_size, h.compress_factor)
             audio_list_r, audio_list_g = list(clean_audio.cpu().numpy()), list(audio_g.detach().cpu().numpy())
-            batch_pesq_score = batch_pesq(audio_list_r, audio_list_g)
+            #batch_pesq_score = batch_pesq(audio_list_r, audio_list_g)
+            batch_stoi_score = batch_stoi(audio_list_r, audio_list_g, h.sampling_rate)
 
             # Discriminator
             optim_d.zero_grad()
             metric_r = discriminator(clean_mag, clean_mag)
             metric_g = discriminator(clean_mag, mag_g.detach())
             loss_disc_r = F.mse_loss(one_labels, metric_r.flatten())
+            loss_disc_g = F.mse_loss(batch_stoi_score.to(device), metric_g.flatten())
             
-            if batch_pesq_score is not None:
-                loss_disc_g = F.mse_loss(batch_pesq_score.to(device), metric_g.flatten())
-            else:
-                loss_disc_g = 0
+            #if batch_pesq_score is not None:
+            #    loss_disc_g = F.mse_loss(batch_stoi_score.to(device), metric_g.flatten())
+            #else:
+            #    loss_disc_g = 0
+
+            #loss_stoi = 1 - torch.mean(batch_stoi_score)
             
-            loss_disc_all = loss_disc_r + loss_disc_g
+            loss_disc_all = loss_disc_r + (1 - torch.mean(batch_stoi_score))
             
             loss_disc_all.backward()
             optim_d.step()
@@ -180,7 +192,7 @@ def train(rank, a, h):
             loss_gen_all.backward()
             optim_g.step()
 
-            if rank == 0:
+            if rank == 0 or a.solo_GPU is not None:
                 # STDOUT logging
                 if steps % a.stdout_interval == 0:
                     with torch.no_grad():
@@ -197,10 +209,10 @@ def train(rank, a, h):
                 if steps % a.checkpoint_interval == 0 and steps != 0:
                     checkpoint_path = "{}/g_{:08d}".format(a.checkpoint_path, steps)
                     save_checkpoint(checkpoint_path,
-                                    {'generator': (generator.module if h.num_gpus > 1 else generator).state_dict()})
+                                    {'generator': (generator.module if (h.num_gpus > 1 and a.solo_GPU is None) else generator).state_dict()})
                     checkpoint_path = "{}/do_{:08d}".format(a.checkpoint_path, steps)
                     save_checkpoint(checkpoint_path, 
-                                    {'discriminator': (discriminator.module if h.num_gpus > 1 else discriminator).state_dict(),
+                                    {'discriminator': (discriminator.module if (h.num_gpus > 1 and a.solo_GPU is None) else discriminator).state_dict(),
                                      'optim_g': optim_g.state_dict(), 'optim_d': optim_d.state_dict(), 'steps': steps,
                                      'epoch': epoch})
 
@@ -222,6 +234,11 @@ def train(rank, a, h):
                     val_mag_err_tot = 0
                     val_pha_err_tot = 0
                     val_com_err_tot = 0
+                    val_stoi_tots = 0
+
+                    sdr_metric = SignalDistortionRatio()
+                    
+                    val_sdr_scores = []
                     with torch.no_grad():
                         for j, batch in enumerate(validation_loader):
                             clean_audio, clean_mag, clean_pha, clean_com, noisy_mag, noisy_pha = batch # [B, 1, F, T], F = nfft // 2+ 1, T = nframes
@@ -230,27 +247,51 @@ def train(rank, a, h):
                             clean_pha = torch.autograd.Variable(clean_pha.to(device, non_blocking=True))
                             clean_com = torch.autograd.Variable(clean_com.to(device, non_blocking=True))
 
+                            print(val_lines[j])
+
                             mag_g, pha_g, com_g = generator(noisy_mag.to(device), noisy_pha.to(device))
 
                             audio_g = mag_pha_istft(mag_g, pha_g, h.n_fft, h.hop_size, h.win_size, h.compress_factor)
                             audios_r += torch.split(clean_audio, 1, dim=0) # [1, T] * B
                             audios_g += torch.split(audio_g, 1, dim=0)
 
+                            val_stoi_score = batch_stoi(list(clean_audio.cpu().numpy()), list(audio_g.detach().cpu().numpy()), h.sampling_rate)
+
+                            # Calculate SDR for the batch
+                            try:
+                                sdr = sdr_metric(audio_g.detach().cpu(), clean_audio.cpu())
+                                val_sdr_scores.append(sdr.item())
+                            except:
+                                if len(val_sdr_scores) > 1:
+                                    val_sdr_scores.append(torch.mean(torch.tensor(val_sdr_scores)).item())
+                                print("SDR calc failed")
+                            
                             val_mag_err_tot += F.mse_loss(clean_mag, mag_g).item()
                             val_ip_err, val_gd_err, val_iaf_err = phase_losses(clean_pha, pha_g, h)
                             val_pha_err_tot += (val_ip_err + val_gd_err + val_iaf_err).item()
                             val_com_err_tot += F.mse_loss(clean_com, com_g).item()
+                            val_stoi = torch.mean(val_stoi_score).item()
 
-                        val_mag_err = val_mag_err_tot / (j+1)
-                        val_pha_err = val_pha_err_tot / (j+1)
-                        val_com_err = val_com_err_tot / (j+1)
-                        val_pesq_score = pesq_score(audios_r, audios_g, h).item()
-                        print('Steps : {:d}, PESQ Score: {:4.3f}, s/b : {:4.3f}'.
-                                format(steps, val_pesq_score, time.time() - start_b))
-                        sw.add_scalar("Validation/PESQ Score", val_pesq_score, steps)
-                        sw.add_scalar("Validation/Magnitude Loss", val_mag_err, steps)
-                        sw.add_scalar("Validation/Phase Loss", val_pha_err, steps)
-                        sw.add_scalar("Validation/Complex Loss", val_com_err, steps)
+                            val_stoi_tots += val_stoi
+                            
+                            val_mag_err = val_mag_err_tot / (j+1)
+                            val_pha_err = val_pha_err_tot / (j+1)
+                            val_com_err = val_com_err_tot / (j+1)
+                            
+                            val_stoi_tot = val_stoi_tots / (j+1)
+                            avg_val_sdr_score = torch.mean(torch.tensor(val_sdr_scores))
+                            
+                            #val_pesq_score = pesq_score(audios_r, audios_g, h).item()
+                            print('Steps : {:d}, SDR: {:.4f}, STOI: {:.4f}, s/b : {:4.3f}'.
+                                    format(steps, val_sdr_scores[j], val_stoi, time.time() - start_b))
+                            #sw.add_scalar("Validation/PESQ Score", val_pesq_score, steps)
+                            sw.add_scalar("Validation/Magnitude Loss", val_mag_err, steps)
+                            sw.add_scalar("Validation/Phase Loss", val_pha_err, steps)
+                            sw.add_scalar("Validation/Complex Loss", val_com_err, steps)
+                            sw.add_scalar('Validation/stoi', val_stoi_tot, steps)
+                            sw.add_scalar("validation/SDR Score", avg_val_sdr_score, steps) 
+                            torch.cuda.empty_cache()
+                        
 
                     generator.train()
 
@@ -259,7 +300,7 @@ def train(rank, a, h):
         scheduler_g.step()
         scheduler_d.step()
         
-        if rank == 0:
+        if rank == 0 or a.solo_GPU is not None:
             print('Time taken for epoch {} is {} sec\n'.format(epoch + 1, int(time.time() - start)))
 
 
@@ -273,13 +314,14 @@ def main():
     parser.add_argument('--input_noisy_wavs_dir', default='VoiceBank+DEMAND/wavs_noisy')
     parser.add_argument('--input_training_file', default='VoiceBank+DEMAND/training.txt')
     parser.add_argument('--input_validation_file', default='VoiceBank+DEMAND/test.txt')
-    parser.add_argument('--checkpoint_path', default='cp_mpsenet')
+    parser.add_argument('--checkpoint_path', default='cp_mpsenet-1024-declip')
     parser.add_argument('--config', default='')
-    parser.add_argument('--training_epochs', default=200, type=int)
+    parser.add_argument('--training_epochs', default=3000, type=int)
     parser.add_argument('--stdout_interval', default=5, type=int)
-    parser.add_argument('--checkpoint_interval', default=5000, type=int)
-    parser.add_argument('--summary_interval', default=100, type=int)
-    parser.add_argument('--validation_interval', default=1000, type=int)
+    parser.add_argument('--checkpoint_interval', default=2500, type=int)
+    parser.add_argument('--summary_interval', default=1000, type=int)
+    parser.add_argument('--validation_interval', default=5000, type=int)
+    parser.add_argument('--solo_GPU', default=None, type=int)
 
     a = parser.parse_args()
 
@@ -298,10 +340,22 @@ def main():
         print('Batch size per GPU :', h.batch_size)
     else:
         pass
-
-    if h.num_gpus > 1:
-        mp.spawn(train, nprocs=h.num_gpus, args=(a, h,))
+    if a.solo_GPU is None:
+        if h.num_gpus > 1:
+            mp.spawn(train, nprocs=h.num_gpus, args=(a, h,))
+        else:
+            train(0, a, h)
+    elif h.num_gpus > 1 and a.solo_GPU != None:
+        try:
+            print(a.solo_GPU)
+            torch.cuda.get_device_properties(a.solo_GPU)
+            train(a.solo_GPU, a, h)
+        except Exception as error:
+            print(error)
+            print(f"GPU: {a.solo_GPU} cannot be used because it probably doesn't exist.")
     else:
+        print("--solo_GPU is only for multi-GPU machines to train on one at a time.")
+        print("training on GPU 0")
         train(0, a, h)
 
 
