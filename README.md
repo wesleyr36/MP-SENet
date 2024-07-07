@@ -11,8 +11,8 @@ This source code is modified from MP-SENet.
 python train.py --config {config_name}.json
 ```
 Checkpoints and a copy of the config file are currently saved in the `cp_mpsenet-1024-declip` directory by default.<br>
-You can change the path by adding `--checkpoint_path` option.
-The code by default scans your system for all avaialble GPUs to train on but if it's home machine and you happen to have 2 GPUs (let's say an RTX 2070 and a Quadro P4000) but want to still use your machine whist training during the day, you can use the `--solo_GPU` flag followed by the ID of the GPU i.e. `--solo_GPU 1` for just the Quadro P4000.
+You can change the path by adding the `--checkpoint_path` option.
+The code by default scans your system for all availbale GPUs to train on but if you're using your personal machine and you happen to have 2 GPUs (let's say an RTX 2070 and a Quadro P4000) and want to still be able use your machine whilst training during the day, you can use the `--solo_GPU` flag followed by the ID of the GPU i.e. `--solo_GPU 1` for just the Quadro P4000 to train on just that GPU.
 
 ## Inference
 ```
