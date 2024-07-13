@@ -314,7 +314,7 @@ def main():
     parser.add_argument('--input_noisy_wavs_dir', default='VoiceBank+DEMAND/wavs_noisy')
     parser.add_argument('--input_training_file', default='VoiceBank+DEMAND/training.txt')
     parser.add_argument('--input_validation_file', default='VoiceBank+DEMAND/test.txt')
-    parser.add_argument('--checkpoint_path', default='cp_mpsenet-1024-declip')
+    parser.add_argument('--checkpoint_path', default='cp_mpsenet-512-larger-declip')
     parser.add_argument('--config', default='')
     parser.add_argument('--training_epochs', default=3000, type=int)
     parser.add_argument('--stdout_interval', default=5, type=int)
