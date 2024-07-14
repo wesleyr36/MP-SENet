@@ -48,7 +48,6 @@ def split_audio_with_overlap(audio, sample_rate, segment_length=3, overlap=2):
     return segments
 
 def process_segment(segment, model, device, h):
-    print(segment.shape)
     segment = torch.FloatTensor(segment).to(device)
     norm_factor = torch.sqrt(len(segment) / torch.sum(segment ** 2.0)).to(device)
     segment = (segment * norm_factor).unsqueeze(0)
@@ -98,10 +97,10 @@ def inference(a):
 
     state_dict = load_checkpoint(a.checkpoint_file, device)
     model.load_state_dict(state_dict['generator'])
-
-    with open(a.input_test_file, 'r', encoding='utf-8') as fi:
-        test_indexes = [x.split('|')[0] for x in fi.read().split('\n') if len(x) > 0]
-
+    if a.input_file is None:
+        with open(a.input_test_file, 'r', encoding='utf-8') as fi:
+            test_indexes = [x.split('|')[0] for x in fi.read().split('\n') if len(x) > 0]
+    test_indexes = [a.input_file]
     os.makedirs(a.output_dir, exist_ok=True)
 
     model.eval()
@@ -111,8 +110,17 @@ def inference(a):
     with torch.no_grad():
         for i, index in enumerate(test_indexes):
             print(index)
-            if noisy_wav.ndim == 1 or a.multi_channel == False:
-                noisy_wav, _ = librosa.load(os.path.join(a.input_noisy_wavs_dir, index + '.wav'), h.sampling_rate, mono=False)
+            if a.input_file is None:
+                path = os.path.join(a.input_noisy_wavs_dir, index + '.wav')
+            else:
+                path = a.input_file
+                
+            #load file
+            noisy_wav, _ = librosa.load(path, h.sampling_rate, mono=False)
+            print(noisy_wav.shape)
+            n_channels = noisy_wav.ndim
+            
+            if n_channels == 1 or a.multi_channel is None:
                 # Split audio into segments with overlap
                 segments = split_audio_with_overlap(noisy_wav, h.sampling_rate)
 
@@ -121,7 +129,10 @@ def inference(a):
 
                 # Concatenate processed segments
                 processed_audio = crossfade_segments(processed_segments, overlap_samples)
-            elif noisy_wav.ndim == 2 and a.multi_channel == True:
+                
+            elif n_channels == 2 and a.multi_channel is not None:
+                processed_audio = []
+                print("should be me")
                 segments_L = split_audio_with_overlap(noisy_wav[0], h.sampling_rate)
                 segments_R = split_audio_with_overlap(noisy_wav[1], h.sampling_rate)
 
@@ -129,15 +140,18 @@ def inference(a):
                 processed_segments_R = []
 
                 # Process each segment
-                for seg in range(segments_L):
-                    processed_segments_L = processed_segments_L.append(process_segment(segments_L[seg], model, device, h))
-                    processed_segments_R = processed_segments_R.append(process_segment(segments_R[seg], model, device, h))
+                for seg in range(len(segments_L)):
+                    processed_segments_L.append(process_segment(segments_L[seg], model, device, h))
+                    processed_segments_R.append(process_segment(segments_R[seg], model, device, h))
+                    print(seg)
                 
                 # Concatenate processed segments
                 processed_audio_L = crossfade_segments(processed_segments_L, overlap_samples)
                 processed_audio_R = crossfade_segments(processed_segments_R, overlap_samples)
-                processed_audio = np.stack((processed_audio_L, processed_audio_R), axis=0)
-            elif noisy_wav.ndim > 2 and a.multi_channel == True:
+                processed_audio = np.stack([processed_audio_L, processed_audio_R], axis=1) 
+                #processed_audio.append(processed_audio_R)
+                
+            elif n_channels > 2 and a.multi_channel == True:
                 segments_channels = []
                 for channel in range(noisy_wav.ndim):
                     segments = []
@@ -147,10 +161,19 @@ def inference(a):
                 processed_segments_channels = []
                 for channel in range(noisy_wav.ndim):
                     processed_segments = []
-                    for seg in range(segments_channels[0]):
-                        processed_segments = processed_segments_L.append(process_segment(segments_channels[channel][seg], model, device, h))
-                        segments_channel s= segments_channels.append(processed_segments)
-            output_file = os.path.join(a.output_dir, index + '.wav')
+                    for seg in range(len(segments_channels[0])):
+                        processed_segments.append(process_segment(segments_channels[channel][seg], model, device, h))
+                        processed_segments_channels.append(processed_segments)
+
+                processed_audio_channels = [crossfade_segments(processed_segments, overlap_samples) for processed_segments in processed_segments_channels]
+                
+                processed_audio = np.stack(processed_audio_channels, axis=1) 
+            else:
+                print("something happened",a.multi_channel,noisy_wav.ndim, (n_channels == 2 and a.multi_channel is not None))
+            if a.input_file is None:
+                output_file = os.path.join(a.output_dir, index + '.wav')
+            else:
+                output_file = os.path.join(a.output_dir, os.path.basename(index))
 
             sf.write(output_file, processed_audio, h.sampling_rate, 'float')
                 
@@ -160,12 +183,13 @@ def main():
     print('Initializing Inference Process..')
 
     parser = argparse.ArgumentParser()
+    parser.add_argument('--input_file', default=None)
     parser.add_argument('--input_clean_wavs_dir', default='VoiceBank+DEMAND/wavs_clean')
     parser.add_argument('--input_noisy_wavs_dir', default='VoiceBank+DEMAND/wavs_noisy')
     parser.add_argument('--input_test_file', default='VoiceBank+DEMAND/test.txt')
     parser.add_argument('--output_dir', default='generated_files')
     parser.add_argument('--checkpoint_file', required=True)
-    parser.add_argument('--multi_channel', default=False)
+    parser.add_argument('--multi_channel', default=None)
     a = parser.parse_args()
 
     config_file = os.path.join(os.path.split(a.checkpoint_file)[0], 'config.json')
