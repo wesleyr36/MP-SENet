@@ -118,9 +118,11 @@ def inference(a):
             #load file
             noisy_wav, _ = librosa.load(path, h.sampling_rate, mono=False)
             print(noisy_wav.shape)
-            n_channels = noisy_wav.ndim
+            n_channels = len(noisy_wav)
+            print(n_channels)
             
             if n_channels == 1 or a.multi_channel is None:
+                print("mono")
                 # Split audio into segments with overlap
                 segments = split_audio_with_overlap(noisy_wav, h.sampling_rate)
 
@@ -131,8 +133,8 @@ def inference(a):
                 processed_audio = crossfade_segments(processed_segments, overlap_samples)
                 
             elif n_channels == 2 and a.multi_channel is not None:
+                print("stereo")
                 processed_audio = []
-                print("should be me")
                 segments_L = split_audio_with_overlap(noisy_wav[0], h.sampling_rate)
                 segments_R = split_audio_with_overlap(noisy_wav[1], h.sampling_rate)
 
@@ -143,7 +145,6 @@ def inference(a):
                 for seg in range(len(segments_L)):
                     processed_segments_L.append(process_segment(segments_L[seg], model, device, h))
                     processed_segments_R.append(process_segment(segments_R[seg], model, device, h))
-                    print(seg)
                 
                 # Concatenate processed segments
                 processed_audio_L = crossfade_segments(processed_segments_L, overlap_samples)
@@ -151,22 +152,25 @@ def inference(a):
                 processed_audio = np.stack([processed_audio_L, processed_audio_R], axis=1) 
                 #processed_audio.append(processed_audio_R)
                 
-            elif n_channels > 2 and a.multi_channel == True:
+            elif n_channels > 2 and a.multi_channel is not None:
+                processed_audio = []
                 segments_channels = []
-                for channel in range(noisy_wav.ndim):
+                print(noisy_wav.shape)
+                for channel in range(n_channels):
                     segments = []
                     segments = split_audio_with_overlap(noisy_wav[channel], h.sampling_rate)
-                    segments_channels = segments_channels.append(segments)
+                    segments_channels.append(segments)
 
                 processed_segments_channels = []
-                for channel in range(noisy_wav.ndim):
+                for channel in range(n_channels):
                     processed_segments = []
                     for seg in range(len(segments_channels[0])):
                         processed_segments.append(process_segment(segments_channels[channel][seg], model, device, h))
-                        processed_segments_channels.append(processed_segments)
+                    processed_segments_channels.append(processed_segments)
+                    print(channel)
 
                 processed_audio_channels = [crossfade_segments(processed_segments, overlap_samples) for processed_segments in processed_segments_channels]
-                
+
                 processed_audio = np.stack(processed_audio_channels, axis=1) 
             else:
                 print("something happened",a.multi_channel,noisy_wav.ndim, (n_channels == 2 and a.multi_channel is not None))
