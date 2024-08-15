@@ -2,6 +2,8 @@
     "num_gpus": 0,
     "batch_size": 4,
     "learning_rate": 0.0005,
+
+    "optimizer": "adamw"
     "adam_b1": 0.8,
     "adam_b2": 0.99,
     "lr_decay": 0.99,
